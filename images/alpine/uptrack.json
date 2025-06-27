@@ -1,0 +1,25 @@
+{
+  "$schema": "https://github.com/framjet/docker-uptrack-action/blob/main/schema.json",
+  "variants": [
+    {
+      "namespace": "framjet",
+      "name": "alpine",
+      "platforms": [
+        "linux/amd64",
+        "linux/arm64"
+      ],
+      "upstream": {
+        "name": "alpine"
+      },
+      "filters": {
+        "tags": [
+          "latest",
+          "3"
+        ]
+      },
+      "buildArgs": {
+        "WAIT4X_VERSION": "latest"
+      }
+    }
+  ]
+}

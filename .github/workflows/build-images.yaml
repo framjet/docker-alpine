@@ -1,0 +1,268 @@
+name: "Build Main Images"
+
+on:
+  schedule:
+    - cron: '20 */6 * * *'  # Check every 6 hours
+  workflow_dispatch:  # Allow manual triggers
+    inputs:
+      force:
+        description: 'Force a rebuild even if source code is unchanged'
+        required: false
+        type: boolean
+        default: false
+
+  push:
+    paths:
+      - 'images/**'
+    branches:
+      - main
+
+jobs:
+  discover-configs:
+    runs-on: [ self-hosted, '${{ github.repository_owner }}' ]
+    outputs:
+      configs: ${{ steps.find-configs.outputs.matrix }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Find uptrack configs
+        id: find-configs
+        run: |
+          # Find all uptrack.json files and create a JSON array
+          CONFIGS=$(find images -name "uptrack.json" -type f | jq -R -s -c 'split("\n")[:-1]')
+          echo "matrix=$CONFIGS" >> $GITHUB_OUTPUT
+
+  track:
+    needs: discover-configs
+    if: needs.discover-configs.outputs.configs != '[]'
+    runs-on: [ self-hosted, '${{ github.repository_owner }}' ]
+    strategy:
+      matrix:
+        config: ${{ fromJson(needs.discover-configs.outputs.configs) }}
+      fail-fast: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          # Enable buildx caching
+          driver-opts: |
+            image=moby/buildkit:master
+            network=host
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Install regctl
+        uses: iarekylew00t/regctl-installer@v3
+
+      - name: Track upstream image
+        id: track
+        uses: framjet/docker-uptrack-action@v1.0.0
+        with:
+          config: ${{ matrix.config }}
+          rev-provider: config
+          force: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.force || 'false' }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Add context to matrix and save to file
+        if: steps.track.outputs.matrix != ''
+        run: |
+          CONTEXT_DIR=$(dirname "${{ matrix.config }}")
+          MATRIX_WITH_CONTEXT=$(echo '${{ steps.track.outputs.matrix }}' | jq --arg dir "$CONTEXT_DIR" -c '
+            if type == "array" then
+              map(. + {"context": $dir})
+            else
+              [. + {"context": $dir}]
+            end
+          ')
+          
+          # Create unique filename for this job's output
+          CONFIG_HASH=$(echo "${{ matrix.config }}" | sha256sum | cut -d' ' -f1)
+          echo "$MATRIX_WITH_CONTEXT" > "matrix_${CONFIG_HASH}.json"
+
+      - name: Upload matrix artifact
+        if: steps.track.outputs.matrix != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: matrix-${{ strategy.job-index }}
+          path: matrix_*.json
+          retention-days: 1
+
+  collect-matrices:
+    needs: track
+    runs-on: [ self-hosted, '${{ github.repository_owner }}' ]
+    outputs:
+      matrix: ${{ steps.combine.outputs.matrix }}
+    steps:
+      - name: Download all matrix artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: matrix-*
+          merge-multiple: true
+
+      - name: Combine all matrices
+        id: combine
+        run: |
+          # Combine all JSON files into a single array
+          COMBINED_MATRIX="[]"
+          for file in matrix_*.json; do
+            if [ -f "$file" ]; then
+              MATRIX_CONTENT=$(cat "$file")
+              COMBINED_MATRIX=$(echo "$COMBINED_MATRIX" "$MATRIX_CONTENT" | jq -s 'add')
+            fi
+          done
+          
+          # Properly escape the JSON for GitHub Actions output
+          echo "matrix<<EOF" >> $GITHUB_OUTPUT
+          echo "$COMBINED_MATRIX" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          
+          echo "Combined matrix: $COMBINED_MATRIX"
+
+  build:
+    needs: collect-matrices
+    name: Build ${{ matrix.imageName }}:${{ matrix.upstream.tag }} for ${{ matrix.platforms }}
+    if: needs.collect-matrices.outputs.matrix != '[]'
+    runs-on: [ self-hosted, '${{ github.repository_owner }}' ]
+    permissions:
+      contents: write
+      packages: write
+    strategy:
+      max-parallel: 4
+      matrix:
+        include: ${{ fromJson(needs.collect-matrices.outputs.matrix) }}
+      fail-fast: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shimataro/ssh-key-action@v2
+        with:
+          key: ${{ secrets.NETCUP_AARCH64_BUILDX_SSH_KEY }}
+          known_hosts: ${{ secrets.NETCUP_AARCH64_BUILDX_SSH_HOST }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          platforms: linux/amd64
+          append: |
+            - endpoint: ${{ secrets.NETCUP_AARCH64_BUILDX_SSH_ENDPOINT }}
+              platforms: linux/arm64
+
+          driver-opts: |
+            image=moby/buildkit:master
+            network=host
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ matrix.imageName }}
+            ghcr.io/${{ github.repository_owner }}/${{ matrix.imageName }}
+          tags: ${{ matrix.tags }}
+          labels: ${{ matrix.labels }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          build-args: ${{ matrix.buildArgs }}
+          platforms: ${{ matrix.platforms }}
+          push: true
+          target: ${{ matrix.buildTarget }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=s3,blobs_prefix=cache/${{ github.repository }}/,manifests_prefix=cache/${{ github.repository }}/,endpoint_url=${{ secrets.S3_CACHE_GHW_ENDPOINT }},access_key_id=${{ secrets.S3_CACHE_GHW_ACCESS }},secret_access_key=${{ secrets.S3_CACHE_GHW_SECRET }},region=${{ secrets.S3_CACHE_GHW_REGION }},bucket=${{ secrets.S3_CACHE_GHW_BUCKET }}
+          cache-to: type=s3,blobs_prefix=cache/${{ github.repository }}/,manifests_prefix=cache/${{ github.repository }}/,endpoint_url=${{ secrets.S3_CACHE_GHW_ENDPOINT }},access_key_id=${{ secrets.S3_CACHE_GHW_ACCESS }},secret_access_key=${{ secrets.S3_CACHE_GHW_SECRET }},region=${{ secrets.S3_CACHE_GHW_REGION }},bucket=${{ secrets.S3_CACHE_GHW_BUCKET }},mode=max
+
+      - name: Generate Discord Embeds
+        run: |
+          JSON_STRING=$(jq -c ".[0].timestamp = \"$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)\"" <<'EOF'
+          [
+                {
+                  "title": "🐳 Docker Image Released: ${{ matrix.fullImageName }}",
+                  "description": "A new Docker image has been built and pushed to the registry.",
+                  "color": 2843737,
+                  "fields": [
+                    {
+                      "name": "📋 Image",
+                      "value": "`${{ matrix.fullImageName }}`",
+                      "inline": true
+                    },
+                    {
+                      "name": "🔄 Rebuild Reason",
+                      "value": "`${{ matrix.reason }}`",
+                      "inline": true
+                    },
+                    {
+                      "name": "⚙️ Platforms",
+                      "value": "`${{ matrix.platforms }}`",
+                      "inline": false
+                    },
+                    {
+                      "name": "🏗️ Built From",
+                      "value": "`${{ matrix.upstream.imageName }}`"
+                    }
+                  ],
+                  "footer": {
+                    "text": "GitHub Actions • ${{ github.repository }}"
+                  },
+                  "timestamp": "$date",
+                  "thumbnail": {
+                    "url": "https://cdn4.iconfinder.com/data/icons/logos-and-brands/512/97_Docker_logo_logos-512.png"
+                  }
+                },
+                {
+                  "title": "Links",
+                  "color": 26367,
+                  "fields": [
+                    {
+                        "name": "📁 Repository",
+                        "value": "[View Repository](https://github.com/${{ github.repository }}/tree/${{ github.sha }})",
+                        "inline": true
+                    },
+                    {
+                      "name": "📜 Source",
+                      "value": "[View Dockerfile](https://github.com/${{ github.repository }}/blob/${{ github.sha }}/${{ matrix.context }}/Dockerfile)",
+                      "inline": true
+                    },
+                    {
+                      "name": "🔍 Workflow Run",
+                      "value": "[View Workflow](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})",
+                      "inline": true
+                    }
+                  ]
+                }
+              ]
+          EOF
+          )
+          echo "DISCORD_EMBEDS=$JSON_STRING" >> $GITHUB_ENV
+
+      - name: Send Discord notification
+        uses: Ilshidur/action-discord@0.3.2
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.FRAMJET_RELEASE_DISCORD_WEBHOOK_URL }}
+        with:
+          args: ""
