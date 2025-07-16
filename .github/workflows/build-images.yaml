@@ -148,6 +148,7 @@ jobs:
         with:
           key: ${{ secrets.NETCUP_AARCH64_BUILDX_SSH_KEY }}
           known_hosts: ${{ secrets.NETCUP_AARCH64_BUILDX_SSH_HOST }}
+          if_key_exists: replace
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
