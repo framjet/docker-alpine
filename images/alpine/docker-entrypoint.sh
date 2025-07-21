@@ -26,7 +26,9 @@ if should_run_entrypoint "$1"; then
     if /usr/bin/find "/docker-entrypoint.d/" -mindepth 1 -maxdepth 1 -type f -print -quit 2>/dev/null | read v; then
         entrypoint_log "/docker-entrypoint.d/ is not empty, will attempt to perform configuration"
         entrypoint_log "Looking for shell scripts in /docker-entrypoint.d/"
-        find "/docker-entrypoint.d/" -follow -type f -print | sort -V | while read -r f; do
+        temp_file=$(mktemp)
+        find "/docker-entrypoint.d/" -follow -type f -print | sort -V > "$temp_file"
+        while read -r f; do
             case "$f" in
                 *.envsh)
                     if [ -x "$f" ]; then
@@ -48,7 +50,8 @@ if should_run_entrypoint "$1"; then
                     ;;
                 *) entrypoint_warn "Ignoring $f";;
             esac
-        done
+        done < "$temp_file"
+        rm -f "$temp_file"
         entrypoint_log "Configuration complete; ready for start up"
     else
         entrypoint_log "No files found in /docker-entrypoint.d/ skipping configuration"
